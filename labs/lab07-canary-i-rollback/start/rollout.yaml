@@ -1,0 +1,90 @@
+# Rollout zamiast Deployment — to jest cała zmiana potrzebna, żeby mieć canary.
+# Reszta specyfikacji poda wygląda identycznie jak w Deploymencie.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: quotes-api
+  labels:
+    app: quotes-api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      app: quotes-api
+
+  strategy:
+    canary:
+      # Ruch dzieli ALB, bez service mesh.
+      trafficRouting:
+        alb:
+          ingress: quotes-api
+          servicePort: 80
+          rootService: quotes-api
+
+      canaryService: quotes-api-canary
+      stableService: quotes-api-stable
+
+      # Kroki: 10% i pauza na decyzję, 50% z pauzą minutową, potem całość.
+      # `pause` bez `duration` czeka na `kubectl argo rollouts promote`.
+      steps:
+        - setWeight: 10
+        - pause: {}
+        - setWeight: 50
+        - pause: { duration: 1m }
+        - setWeight: 100
+
+      # Bramka na metrykach: jeśli odsetek 5xx przekroczy próg, rollout
+      # cofa się sam, bez czekania na człowieka.
+      analysis:
+        templates:
+          - templateName: odsetek-bledow
+        startingStep: 1
+        args:
+          # Metryki filtrujemy po namespace (klaster jest wspólny) i po hashu
+          # szablonu poda canary — Service ani nazwa wersji nie trafiają do metryk.
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: canary-hash
+            valueFrom:
+              podTemplateHashValue: Latest
+
+  template:
+    metadata:
+      labels:
+        app: quotes-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: quotes-api
+          image: PODMIEN_NA_ECR/quotes-api:v1
+          ports:
+            - containerPort: 8000
+          # APP_VERSION pochodzi z obrazu (build-arg w Dockerfile). Nie ustawiaj jej tutaj —
+          # wartość z manifestu nadpisałaby wersję obrazu i canary v2 wyglądałby jak v1.
+          env:
+            # flagd działa w Twoim namespace (flagd.yaml), więc wystarczy krótka nazwa usługi.
+            - name: FLAGD_HOST
+              value: flagd
+            # Jawnie — inaczej Kubernetes wstrzyknąłby z usługi `flagd` zmienną
+            # FLAGD_PORT=tcp://<ip>:8013 i aplikacja po cichu wróciłaby do pliku flag.
+            - name: FLAGD_PORT
+              value: "8013"
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10

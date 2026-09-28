@@ -1,0 +1,44 @@
+# Dzień 1: najprostsze wdrożenie na klaster — zwykły Deployment, bez Argo Rollouts.
+# W dniu 2 tę samą aplikację wdrażamy jako Rollout (app/k8s/) z canary i analizą metryk.
+#
+# Nazwa i etykieta `quotes-api-d1` są celowo inne niż `quotes-api` z dnia 2:
+# serwisy z lab07 wybierają pody po `app: quotes-api` i nie mogą złapać tego poda.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quotes-api-d1
+  labels:
+    app: quotes-api-d1
+    szkolenie/dzien: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quotes-api-d1
+  template:
+    metadata:
+      labels:
+        app: quotes-api-d1
+        szkolenie/dzien: "1"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: quotes-api
+          # Pipeline podmienia znacznik na pełny adres obrazu z ECR (tag = SHA commita).
+          image: PODMIEN_NA_OBRAZ
+          ports:
+            - containerPort: 8000
+          # Namespace ma ResourceQuota na requests i limits — pod bez `resources`
+          # zostanie odrzucony (`must specify limits.cpu...`). Wartości są małe,
+          # żeby nie zabrać miejsca canary z dnia 2.
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
