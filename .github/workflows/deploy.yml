@@ -1,0 +1,139 @@
+name: Deploy quotes-api
+
+# Wdrażamy tylko z main — build/push do ECR i deploy na klaster nie mają prawa
+# odpalić się z pull requestu (także z forka).
+on:
+  push:
+    branches: [main]
+
+# Domyślnie żaden job nic nie może — każdy poniżej deklaruje własny,
+# minimalny zakres i uzasadnienie przy swoim bloku permissions.
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Job tylko czyta kod repo, żeby go zlintować — nie potrzebuje żadnych
+    # zapisów ani dostępu do sekretów/AWS.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Analogicznie do lint — tylko checkout i uruchomienie testów, bez zapisu
+    # czegokolwiek i bez dostępu do AWS.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  build:
+    name: Build i push obrazu do ECR
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Dodatkowe, jawne zabezpieczenie — trigger workflow już ogranicza się do
+    # push na main, ale ten warunek zostaje na wypadek, gdyby ktoś kiedyś
+    # rozszerzył trigger (np. o pull_request).
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # contents: read — checkout kodu i Dockerfile'a do zbudowania obrazu.
+    # id-token: write — wymagane, żeby configure-aws-credentials mogło wymienić
+    # token OIDC na krótkotrwałe poświadczenia AWS potrzebne do push'a do ECR
+    # (bez tego nie da się uwierzytelnić bez długoterminowych kluczy).
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Adres obrazu liczymy raz, tu, i przekazujemy dalej przez outputs —
+      # deploy nie ma prawa sam odgadywać ani przeliczać taga (build once,
+      # deploy many). Tag = pełny SHA commita, nigdy "latest".
+      - id: image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/quotes-api:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+
+  deploy:
+    name: Deploy na EKS
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # contents: read — checkout manifestów z app/k8s-dzien1/.
+    # id-token: write — ten sam mechanizm OIDC co w build, tym razem do
+    # aws eks update-kubeconfig i uwierzytelnienia kubectl wobec klastra.
+    #
+    # Celowo BEZ klucza `environment:` na tym jobie — zmieniłby claim `sub`
+    # w tokenie OIDC (z repo:.../ref:refs/heads/main na repo:.../environment:X)
+    # i złamałby zaufanie już skonfigurowane dla roli AWS_DEPLOY_ROLE_ARN.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - run: aws eks update-kubeconfig --name szkolenie-ai-devops --region eu-central-1
+
+      # Manifest ma placeholder PODMIEN_NA_OBRAZ — podmieniamy go na obraz
+      # zbudowany w jobie build i od razu aplikujemy gotowy manifest jedną
+      # komendą, żeby pod nigdy nie próbował wystartować z placeholderem
+      # jako obrazem.
+      - name: Podmień obraz i wdróż Deployment
+        run: |
+          sed "s|PODMIEN_NA_OBRAZ|${{ needs.build.outputs.image }}|" \
+            app/k8s-dzien1/deployment.yaml \
+            | kubectl apply -n ${{ vars.K8S_NAMESPACE }} -f -
+          kubectl apply -n ${{ vars.K8S_NAMESPACE }} -f app/k8s-dzien1/service.yaml
+
+      - name: Czekaj na rollout
+        run: |
+          kubectl rollout status deployment/quotes-api-d1 \
+            -n ${{ vars.K8S_NAMESPACE }} --timeout=120s
