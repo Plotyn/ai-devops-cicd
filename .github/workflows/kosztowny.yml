@@ -1,41 +1,91 @@
-# Workflow napisany „żeby działał". Działa. Kosztuje około 40 minut rozliczeniowych
-# runnera na każde uruchomienie. Nic tu nie jest błędem składniowym — wszystko jest marnotrawstwem.
+# Workflow napisany „żeby działał". Działał, ale kosztował ok. 40 minut rozliczeniowych
+# runnera na każde uruchomienie. Nic tu nie było błędem składniowym — wszystko było
+# marnotrawstwem. Poniżej te same 5 kroków (lint, test, build, scan, artefakty),
+# tylko bez płacenia za środowiska, których nikt nie sprawdza, i bez robienia tego
+# samego builda dwa razy.
 name: kosztowny
 
 # Na szkoleniu uruchamiany ręcznie (gh workflow run), żeby nie palić minut przy każdym pushu.
 # W oryginale było tu `on: push`.
 on: workflow_dispatch
 
+# Domyślnie żaden job nic nie może — każdy deklaruje własny, minimalny zakres.
+permissions: {}
+
 jobs:
   lint:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.10", "3.11", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: pip install -r app/requirements-dev.txt
-      - run: ruff check app/
-
-  test:
-    needs: lint
+    # PRZED: macierz 3 systemy × 3 wersje Pythona = 9 przebiegów, w tym 3 na macOS
+    # (0,062 USD/min, ponad 10x drożej niż Linux) i 3 na Windows (0,010 USD/min).
+    # Obraz produkcyjny (app/Dockerfile) to zawsze python:3.12-slim na Linuksie —
+    # lint na macOS z Pythonem 3.10 nie sprawdzał niczego, czego nie sprawdza już
+    # Linux+3.12, więc macierz została zdjęta do jednej, realnej kombinacji.
+    #
+    # Oszczędność: 9 jobów (3×0,006 + 3×0,010 + 3×0,062 = 0,234 USD) → 1 job
+    # (1×0,006 USD) = -0,228 USD, czyli ok. 38 minut w przeliczeniu na Linuksa
+    # (0,228 / 0,006 USD za minutę linuksową). Liczone wprost z cennika GitHub
+    # Actions, ten sam sposób co koszt-przebiegu.sh.
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # tylko checkout kodu do zlintowania
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r app/requirements-dev.txt
+      - run: ruff check app/
+
+  test:
+    # PRZED: `needs: lint`, więc test czekał, aż skończy się cała 9-elementowa
+    # macierz lintu, mimo że nie zależy od jej wyniku — oba joby potrzebują tylko
+    # checkoutu kodu. Usunięcie `needs` puszcza je równolegle.
+    #
+    # Oszczędność w USD: 0 — to nadal 2 osobne joby po minimum 1 rozliczanej
+    # minucie każdy, a GitHub bilingowo liczy sumę minut jobów, nie czas
+    # zegarowy całego przebiegu. Realny zysk to krótszy czas oczekiwania na
+    # wynik testów, nie niższy rachunek — zaznaczam to wprost, żeby nie
+    # zawyżać oszczędności, których nie da się policzyć z cennika.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # tylko checkout kodu i uruchomienie testów
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
       - run: pip install -r app/requirements-dev.txt
       - run: pytest -q
         working-directory: app
 
-  build:
-    needs: test
+  build-i-scan:
+    # PRZED: `build` budował obraz (bez push, bez load — czyli donikąd), a `scan`
+    # dostawał czysty runner i budował TEN SAM obraz jeszcze raz od zera, bo obraz
+    # nie przechodzi między jobami. Podwójna praca i dodatkowy, w pełni rozliczany
+    # job. Połączenie w jeden job z `load: true` buduje obraz raz i od razu go
+    # skanuje na tym samym runnerze.
+    #
+    # Oszczędność: usunięcie całego drugiego joba = -1 minuta rozliczana na
+    # Linuksie = -0,006 USD.
+    #
+    # Dodatkowo: PRZED brakowało `cache-to` przy `cache-from: type=gha` — to
+    # najczęstsza pułapka przy cache'owaniu Dockera, bo wygląda na poprawnie
+    # skonfigurowane, a cache nigdy nie powstaje, więc `cache-from` zawsze trafia
+    # w pustkę. Dodane `cache-to: type=gha,mode=max` naprawia to, ale oszczędności
+    # w USD nie zakładam z góry: pierwszy przebieg dopiero zapisuje cache (patrz
+    # pułapka „pomiar po pierwszym przebiegu"), a każdy job i tak jest rozliczany
+    # minimum 1 minutę — realny zysk będzie widoczny dopiero, jeśli porównamy
+    # czas tego joba w dwóch kolejnych przebiegach.
+    needs: [lint, test]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout kodu i Dockerfile'a do zbudowania obrazu; brak push/deploy, więc bez id-token
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -43,21 +93,22 @@ jobs:
         with:
           context: app/
           tags: quotes-api:${{ github.sha }}
+          load: true
           cache-from: type=gha
-
-  scan:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t quotes-api:${{ github.sha }} app/
-      - uses: aquasecurity/trivy-action@master
+          cache-to: type=gha,mode=max
+      # Przypięte do konkretnej wersji zamiast @master — cudzy kod na runnerze
+      # w wersji, której nikt nie zatwierdził, to osobne ryzyko niezwiązane
+      # z kosztem, ale skoro i tak edytujemy ten plik, poprawiam przy okazji.
+      - uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: quotes-api:${{ github.sha }}
 
   artefakty:
-    needs: scan
+    needs: build-i-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout kodu, który trafia do artefaktu
     steps:
       - uses: actions/checkout@v4
       - uses: actions/upload-artifact@v4
