@@ -18,6 +18,10 @@ sekrety poza `run:`, brak `pull_request_target` z checkoutem forka.
 **Python** — obsługa błędów, zapytania w pętli, dane wrażliwe w logach, brak testu
 do nowej ścieżki kodu.
 
+**Docker/Kubernetes** — sekret albo klucz zaszyty w warstwie obrazu (`ENV`/`ARG` z realną
+wartością, nawet „tymczasową" — zostaje w historii warstw na stałe), obraz działający jako
+root, base image bez przypiętej wersji, brak `resources`/probes w manifeście.
+
 ## Format znaleziska
 
 ```
