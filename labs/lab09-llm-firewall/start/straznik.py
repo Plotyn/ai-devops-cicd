@@ -25,6 +25,13 @@ WZORCE = [
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "klucz prywatny"),
     (r"(?i)(postgres(ql)?|mysql|mongodb)://[^\s:]+:[^\s@]+@", "connection string z hasłem"),
     (r"(?i)\b(hasło|password|passwd)\s*[=:]\s*\S{6,}", "hasło w treści"),
+    # ARN sam w sobie jest jednoznaczny (stały prefiks arn:aws:, stała liczba pól) —
+    # nie potrzebuje dodatkowego kontekstu, żeby uznać go za trafienie.
+    (r"\barn:aws:[a-zA-Z0-9][a-zA-Z0-9.\-]*:[a-z0-9-]*:\d{12}:\S+", "ARN zasobu AWS"),
+    # 12 cyfr pod rząd to też numer telefonu, numer faktury itd. — łapiemy je
+    # tylko w kontekście słowa "konto"/"account", inaczej reguła blokowałaby
+    # za dużo i zostałaby wyłączona w pierwszym tygodniu.
+    (r"(?i)\b(konto|account)(\s+id|\s+number|\s+numer)?\s*[:#]?\s*\d{12}\b", "identyfikator konta AWS"),
 ]
 
 
